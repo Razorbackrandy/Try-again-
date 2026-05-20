@@ -6,9 +6,11 @@ Run with:  python demo.py
 Demonstrates:
   1. Routing by exact type, prefix, regex, and wildcard fallback
   2. Retry with exponential back-off (simulated payment gateway failure)
-  3. Priority queue (high-priority SMS dispatched before low-priority webhooks)
+  3. Priority queue (high-priority items dispatched before low-priority ones)
   4. Dead-letter queue inspection
   5. Metrics middleware
+  6. Async submit
+  7. Scheduled execution (run_at / delay) and cancellation
 """
 import logging
 import time
@@ -69,6 +71,18 @@ def handle_fallback(task: Task):
     return None
 
 
+order_log: list = []
+
+def track_priority(task: Task):
+    order_log.append(task.priority)
+    print(f"    [TRACKED] priority={task.priority}")
+
+
+def scheduled_handler(task: Task):
+    elapsed = time.time() - task.payload["queued_at"]
+    print(f"    [SCHEDULED] payload={task.payload['label']!r}  fired after {elapsed:.2f}s")
+
+
 # ---------------------------------------------------------------------------
 # Build the router
 # ---------------------------------------------------------------------------
@@ -89,6 +103,8 @@ router.add(Route.exact(
     handle_payment,
     retry_policy=RetryPolicy(max_attempts=3, base_delay=0.05, max_delay=1.0, jitter=False),
 ))
+router.add(Route.exact("tracked",   track_priority,    retry_policy=NO_RETRY))
+router.add(Route.exact("scheduled", scheduled_handler, retry_policy=NO_RETRY))
 router.add(Route.wildcard(handle_fallback, retry_policy=NO_RETRY))
 
 
@@ -124,13 +140,6 @@ for t in tasks:
 print("\n" + "=" * 60)
 print("  2. Priority queue — items drain in high→low priority order")
 print("=" * 60)
-
-order_log: list = []
-
-@router.route("tracked")
-def track_priority(task: Task):
-    order_log.append(task.priority)
-    print(f"    [TRACKED] priority={task.priority}")
 
 for priority in [1, 5, 3, 10, 2]:
     router.enqueue(Task(type="tracked", priority=priority))
@@ -185,6 +194,33 @@ print("=" * 60)
 fut = router.submit(Task("email.send", payload={"to": "bob@example.com", "subject": "Async!"}))
 result = fut.result(timeout=5)
 print(f"    Future resolved → status={result.status.value}  value={result.value}")
+
+
+# ---------------------------------------------------------------------------
+# 6. Scheduled execution
+# ---------------------------------------------------------------------------
+
+print("\n" + "=" * 60)
+print("  6. Scheduled execution")
+print("=" * 60)
+
+router.start()           # start the scheduler thread
+
+now = time.time()
+router.schedule_in(Task(type="scheduled", payload={"label": "alpha", "queued_at": now}), delay=0.15)
+router.schedule_in(Task(type="scheduled", payload={"label": "beta",  "queued_at": now}), delay=0.30)
+router.schedule_in(Task(type="scheduled", payload={"label": "gamma", "queued_at": now}), delay=0.45)
+
+# Cancel the middle one before it fires
+cancel_id = router.schedule_in(
+    Task(type="scheduled", payload={"label": "CANCELLED", "queued_at": now}),
+    delay=0.40,
+)
+cancelled = router.cancel(cancel_id)
+print(f"    Pre-cancellation result for 'CANCELLED' task: {cancelled}")
+
+# Wait for all scheduled tasks to fire
+time.sleep(0.7)
 
 
 router.shutdown()

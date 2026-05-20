@@ -5,6 +5,7 @@ Routes tasks to registered handlers by type, prefix, regex, or custom predicate.
 
 Features:
   • Priority queues            – higher-priority tasks run first
+  • Scheduled execution        – run tasks at a future time or after a delay
   • Retry with backoff/jitter  – configurable per route
   • Middleware chain           – logging, metrics, auth, etc.
   • Thread-pool workers        – concurrent, bounded execution
@@ -64,6 +65,7 @@ class Task:
     id: str = field(default_factory=lambda: str(uuid.uuid4()))
     metadata: Dict[str, Any] = field(default_factory=dict)
     attempt: int = field(default=0, compare=False)
+    scheduled_at: Optional[float] = field(default=None, compare=False)  # Unix epoch
 
     # Heap ordering: negate priority so max-priority = min-heap root
     def __lt__(self, other: "Task") -> bool:
@@ -256,6 +258,7 @@ class TaskRouter:
         workers: int = 4,
         middleware: Optional[List[Middleware]] = None,
         dead_letter: Optional[Callable[[TaskResult], None]] = None,
+        scheduler_tick: float = 0.1,
     ) -> None:
         self._routes: List[Route] = []
         self._middleware: List[Middleware] = (
@@ -269,6 +272,14 @@ class TaskRouter:
         )
         self._heap: List[Task] = []
         self._heap_lock = threading.Lock()
+
+        # Scheduler — (run_at, task) min-heap plus a cancellation set
+        self._schedule_heap: List[Tuple[float, Task]] = []
+        self._schedule_lock = threading.Lock()
+        self._cancelled: set = set()
+        self._scheduler_tick = scheduler_tick
+        self._scheduler_stop: Optional[threading.Event] = None
+        self._scheduler_thread: Optional[threading.Thread] = None
 
     # ---- Route registration ----------------------------------------------
 
@@ -384,6 +395,92 @@ class TaskRouter:
                 tasks.append(heapq.heappop(self._heap))
         return [self.submit(t) for t in tasks]
 
+    # ---- Scheduled execution ---------------------------------------------
+
+    def schedule(self, task: Task, *, run_at: float) -> str:
+        """
+        Schedule *task* to run at the given Unix timestamp.  Returns the
+        task id (use with :meth:`cancel` to abort before it fires).
+
+        The scheduler thread must be running — call :meth:`start` first
+        (the context-manager form does this automatically).
+        """
+        task.scheduled_at = run_at
+        with self._schedule_lock:
+            heapq.heappush(self._schedule_heap, (run_at, task))
+        return task.id
+
+    def schedule_in(self, task: Task, *, delay: float) -> str:
+        """Schedule *task* to run *delay* seconds from now."""
+        return self.schedule(task, run_at=time.time() + delay)
+
+    def cancel(self, task_id: str) -> bool:
+        """
+        Mark a scheduled task for cancellation.  Returns ``True`` if the
+        task was still in the schedule heap, ``False`` if it had already
+        fired (or was never scheduled).
+        """
+        with self._schedule_lock:
+            present = any(t.id == task_id for _, t in self._schedule_heap)
+            if present:
+                self._cancelled.add(task_id)
+        return present
+
+    def start(self) -> "TaskRouter":
+        """Start the background scheduler thread (idempotent)."""
+        if self._scheduler_thread is not None and self._scheduler_thread.is_alive():
+            return self
+        self._scheduler_stop = threading.Event()
+        self._scheduler_thread = threading.Thread(
+            target=self._scheduler_loop,
+            name="task-router-scheduler",
+            daemon=True,
+        )
+        self._scheduler_thread.start()
+        return self
+
+    def stop(self, wait: bool = True, timeout: float = 5.0) -> None:
+        """Stop the background scheduler thread."""
+        if self._scheduler_stop is None or self._scheduler_thread is None:
+            return
+        self._scheduler_stop.set()
+        if wait:
+            self._scheduler_thread.join(timeout=timeout)
+        self._scheduler_thread = None
+        self._scheduler_stop = None
+
+    def _scheduler_loop(self) -> None:
+        """Background loop that submits scheduled tasks when their time arrives."""
+        stop_event = self._scheduler_stop
+        assert stop_event is not None
+        while not stop_event.is_set():
+            now = time.time()
+            due: List[Task] = []
+            next_at: Optional[float] = None
+
+            with self._schedule_lock:
+                while self._schedule_heap and self._schedule_heap[0][0] <= now:
+                    _, task = heapq.heappop(self._schedule_heap)
+                    if task.id in self._cancelled:
+                        self._cancelled.discard(task.id)
+                        continue
+                    due.append(task)
+                if self._schedule_heap:
+                    next_at = self._schedule_heap[0][0]
+
+            for task in due:
+                try:
+                    self.submit(task)
+                except RuntimeError:
+                    # Executor already shut down — drop remaining tasks.
+                    return
+
+            if next_at is None:
+                wait_for = self._scheduler_tick
+            else:
+                wait_for = max(0.001, min(next_at - time.time(), self._scheduler_tick))
+            stop_event.wait(wait_for)
+
     # ---- Dead-letter queue -----------------------------------------------
 
     def _default_dlq(self, result: TaskResult) -> None:
@@ -403,10 +500,12 @@ class TaskRouter:
     # ---- Lifecycle -------------------------------------------------------
 
     def shutdown(self, wait: bool = True) -> None:
-        """Shut down the worker pool."""
+        """Shut down the scheduler (if running) and worker pool."""
+        self.stop(wait=wait)
         self._executor.shutdown(wait=wait)
 
     def __enter__(self) -> "TaskRouter":
+        self.start()
         return self
 
     def __exit__(self, *_) -> None:

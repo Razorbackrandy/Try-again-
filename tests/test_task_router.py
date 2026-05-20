@@ -432,6 +432,101 @@ class TestContextManager:
 # Payload passthrough
 # ---------------------------------------------------------------------------
 
+class TestScheduling:
+    def test_schedule_in_fires_after_delay(self):
+        fired_at: list = []
+
+        def record(task):
+            fired_at.append(time.time())
+
+        r = TaskRouter(middleware=[], scheduler_tick=0.02)
+        r.add(Route.wildcard(record, retry_policy=NO_RETRY))
+        r.start()
+
+        t0 = time.time()
+        r.schedule_in(Task(type="t"), delay=0.1)
+
+        # poll until executed or timeout
+        deadline = t0 + 2.0
+        while not fired_at and time.time() < deadline:
+            time.sleep(0.02)
+
+        r.shutdown(wait=False)
+        assert len(fired_at) == 1
+        assert fired_at[0] - t0 >= 0.09         # fired no earlier than requested
+        assert fired_at[0] - t0 < 1.0           # and reasonably soon after
+
+    def test_schedule_at_past_fires_immediately(self):
+        fired: list = []
+        r = TaskRouter(middleware=[], scheduler_tick=0.02)
+        r.add(Route.wildcard(lambda t: fired.append(1), retry_policy=NO_RETRY))
+        r.start()
+
+        r.schedule(Task(type="t"), run_at=time.time() - 1.0)
+
+        deadline = time.time() + 2.0
+        while not fired and time.time() < deadline:
+            time.sleep(0.02)
+
+        r.shutdown(wait=False)
+        assert len(fired) == 1
+
+    def test_schedule_ordering(self):
+        order: list = []
+        r = TaskRouter(workers=1, middleware=[], scheduler_tick=0.02)
+        r.add(Route.wildcard(lambda t: order.append(t.payload), retry_policy=NO_RETRY))
+        r.start()
+
+        # Submit out of order
+        r.schedule_in(Task(type="t", payload="third"),  delay=0.30)
+        r.schedule_in(Task(type="t", payload="first"),  delay=0.10)
+        r.schedule_in(Task(type="t", payload="second"), delay=0.20)
+
+        deadline = time.time() + 3.0
+        while len(order) < 3 and time.time() < deadline:
+            time.sleep(0.02)
+
+        r.shutdown(wait=False)
+        assert order == ["first", "second", "third"]
+
+    def test_cancel_prevents_execution(self):
+        fired: list = []
+        r = TaskRouter(middleware=[], scheduler_tick=0.02)
+        r.add(Route.wildcard(lambda t: fired.append(1), retry_policy=NO_RETRY))
+        r.start()
+
+        task_id = r.schedule_in(Task(type="t"), delay=0.20)
+        assert r.cancel(task_id) is True
+
+        time.sleep(0.40)
+        r.shutdown(wait=False)
+        assert fired == []
+
+    def test_cancel_returns_false_for_unknown(self):
+        r = TaskRouter(middleware=[])
+        assert r.cancel("nonexistent-id") is False
+        r.shutdown(wait=False)
+
+    def test_context_manager_starts_scheduler(self):
+        fired: list = []
+        with TaskRouter(middleware=[], scheduler_tick=0.02) as r:
+            r.add(Route.wildcard(lambda t: fired.append(1), retry_policy=NO_RETRY))
+            r.schedule_in(Task(type="t"), delay=0.05)
+            deadline = time.time() + 1.0
+            while not fired and time.time() < deadline:
+                time.sleep(0.02)
+        assert fired == [1]
+
+    def test_start_is_idempotent(self):
+        r = TaskRouter(middleware=[])
+        r.start()
+        thread1 = r._scheduler_thread
+        r.start()
+        thread2 = r._scheduler_thread
+        assert thread1 is thread2
+        r.shutdown(wait=False)
+
+
 class TestPayload:
     def test_payload_is_accessible_in_handler(self, router):
         router.add(Route.wildcard(lambda t: t.payload["x"] * 2, retry_policy=NO_RETRY))
