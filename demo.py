@@ -11,6 +11,7 @@ Demonstrates:
   5. Metrics middleware
   6. Async submit
   7. Scheduled execution (run_at / delay) and cancellation
+  8. Circuit breaker (trips after N failures, auto-recovers)
 """
 import logging
 import time
@@ -23,6 +24,8 @@ from task_router import (
     NO_RETRY,
     FAST_RETRY,
     metrics_middleware,
+    CircuitBreaker,
+    CircuitBreakerState,
 )
 
 logging.basicConfig(
@@ -224,4 +227,36 @@ time.sleep(0.7)
 
 
 router.shutdown()
+
+
+# ---------------------------------------------------------------------------
+# 8. Circuit breaker demo
+# ---------------------------------------------------------------------------
+
+print("\n" + "=" * 60)
+print("  8. Circuit breaker — trips after 3 failures, recovers")
+print("=" * 60)
+
+cb = CircuitBreaker(failure_threshold=3, recovery_timeout=0.3, success_threshold=1)
+cb_router = TaskRouter(workers=2, middleware=[])
+cb_router.add(Route.exact(
+    "flaky.service",
+    lambda t: (_ for _ in ()).throw(RuntimeError("downstream error"))
+              if not t.payload.get("recover") else "ok",
+    retry_policy=NO_RETRY,
+    circuit_breaker=cb,
+))
+
+for i in range(5):
+    result = cb_router.dispatch(Task("flaky.service", payload={}))
+    print(f"    attempt {i + 1}: status={result.status.value:<10}  cb={cb.state.value}")
+
+print(f"    waiting {cb.recovery_timeout}s for recovery window…")
+time.sleep(cb.recovery_timeout + 0.05)
+
+result = cb_router.dispatch(Task("flaky.service", payload={"recover": True}))
+print(f"    probe result:  status={result.status.value:<10}  cb={cb.state.value}")
+
+cb_router.shutdown(wait=False)
+
 print("\n✓ Demo complete.\n")

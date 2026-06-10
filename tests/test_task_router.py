@@ -22,6 +22,12 @@ from task_router import (
     FAST_RETRY,
     logging_middleware,
     metrics_middleware,
+    HandlerTimeoutError,
+    CircuitBreaker,
+    CircuitBreakerState,
+    CircuitOpenError,
+    RateLimiter,
+    RateLimitError,
 )
 
 
@@ -525,6 +531,233 @@ class TestScheduling:
         thread2 = r._scheduler_thread
         assert thread1 is thread2
         r.shutdown(wait=False)
+
+
+# ---------------------------------------------------------------------------
+# Execution timeout
+# ---------------------------------------------------------------------------
+
+class TestTimeout:
+    def test_slow_handler_produces_timeout_error(self, router):
+        router.add(Route.exact(
+            "slow", lambda t: time.sleep(5), retry_policy=NO_RETRY, timeout=0.05,
+        ))
+        result = router.dispatch(Task(type="slow"))
+        assert result.status == TaskStatus.DEAD
+        assert isinstance(result.error, HandlerTimeoutError)
+
+    def test_timeout_is_per_attempt_not_total(self, router):
+        calls = []
+
+        def handler(task):
+            calls.append(1)
+            if len(calls) < 3:
+                time.sleep(5)
+            return "ok"
+
+        router.add(Route.exact(
+            "retry-timeout",
+            handler,
+            retry_policy=RetryPolicy(max_attempts=3, base_delay=0.0, jitter=False),
+            timeout=0.05,
+        ))
+        result = router.dispatch(Task(type="retry-timeout"))
+        assert result.status == TaskStatus.SUCCEEDED
+        assert len(calls) == 3
+
+    def test_fast_handler_not_affected(self, router):
+        router.add(Route.exact("fast", lambda t: "done", retry_policy=NO_RETRY, timeout=5.0))
+        result = router.dispatch(Task(type="fast"))
+        assert result.status == TaskStatus.SUCCEEDED
+        assert result.value == "done"
+
+    def test_no_timeout_unchanged_behavior(self, router):
+        router.add(Route.exact("x", lambda t: 42, retry_policy=NO_RETRY))
+        assert router.dispatch(Task(type="x")).value == 42
+
+    def test_elapsed_bounded_by_timeout(self, router):
+        router.add(Route.exact(
+            "slow", lambda t: time.sleep(10), retry_policy=NO_RETRY, timeout=0.1,
+        ))
+        t0 = time.perf_counter()
+        router.dispatch(Task(type="slow"))
+        assert time.perf_counter() - t0 < 1.0
+
+
+# ---------------------------------------------------------------------------
+# Circuit breaker
+# ---------------------------------------------------------------------------
+
+class TestCircuitBreaker:
+    def _route(self, handler, *, threshold=3, recovery=0.15, success_req=1, **kw):
+        cb = CircuitBreaker(
+            failure_threshold=threshold,
+            recovery_timeout=recovery,
+            success_threshold=success_req,
+        )
+        route = Route.exact("svc", handler, retry_policy=NO_RETRY, circuit_breaker=cb, **kw)
+        return route, cb
+
+    def test_closed_passes_through(self, router):
+        route, cb = self._route(lambda t: "ok")
+        router.add(route)
+        result = router.dispatch(Task(type="svc"))
+        assert result.status == TaskStatus.SUCCEEDED
+        assert cb.state == CircuitBreakerState.CLOSED
+
+    def test_opens_after_failure_threshold(self, router):
+        def fail(t): raise RuntimeError("x")
+        route, cb = self._route(fail)
+        router.add(route)
+        for _ in range(3):
+            router.dispatch(Task(type="svc"))
+        assert cb.state == CircuitBreakerState.OPEN
+
+    def test_open_state_fast_fails(self, router):
+        def fail(t): raise RuntimeError("x")
+        route, cb = self._route(fail)
+        router.add(route)
+        for _ in range(3):
+            router.dispatch(Task(type="svc"))
+        result = router.dispatch(Task(type="svc"))
+        assert result.status == TaskStatus.REJECTED
+        assert isinstance(result.error, CircuitOpenError)
+
+    def test_transitions_to_half_open_then_closes(self, router):
+        def fail(t): raise RuntimeError("x")
+        route, cb = self._route(fail, recovery=0.05)
+        router.add(route)
+        for _ in range(3):
+            router.dispatch(Task(type="svc"))
+        assert cb.state == CircuitBreakerState.OPEN
+        time.sleep(0.1)
+        route.handler = lambda t: "recovered"
+        result = router.dispatch(Task(type="svc"))
+        assert result.status == TaskStatus.SUCCEEDED
+        assert cb.state == CircuitBreakerState.CLOSED
+
+    def test_probe_failure_reopens_circuit(self, router):
+        def fail(t): raise RuntimeError("still failing")
+        route, cb = self._route(fail, recovery=0.05)
+        router.add(route)
+        for _ in range(3):
+            router.dispatch(Task(type="svc"))
+        time.sleep(0.1)
+        router.dispatch(Task(type="svc"))   # probe — fails
+        assert cb.state == CircuitBreakerState.OPEN
+
+    def test_success_threshold_gt_one(self, router):
+        route, cb = self._route(
+            lambda t: (_ for _ in ()).throw(RuntimeError("x")),
+            recovery=0.05,
+            success_req=2,
+        )
+        router.add(route)
+        for _ in range(3):
+            router.dispatch(Task(type="svc"))
+        time.sleep(0.1)
+        route.handler = lambda t: "ok"
+        router.dispatch(Task(type="svc"))   # probe 1
+        assert cb.state == CircuitBreakerState.HALF_OPEN
+        router.dispatch(Task(type="svc"))   # probe 2
+        assert cb.state == CircuitBreakerState.CLOSED
+
+    def test_cb_thread_safety(self):
+        def fail(t): raise RuntimeError("x")
+        cb = CircuitBreaker(failure_threshold=10, recovery_timeout=60.0)
+        route = Route.exact("svc", fail, retry_policy=NO_RETRY, circuit_breaker=cb)
+        r = TaskRouter(workers=8, middleware=[])
+        r.add(route)
+        futures = [r.submit(Task(type="svc")) for _ in range(50)]
+        [f.result(timeout=10) for f in futures]
+        r.shutdown()
+        assert cb.state in (CircuitBreakerState.CLOSED, CircuitBreakerState.OPEN)
+
+    def test_cb_none_is_disabled(self, router):
+        router.add(Route.exact("x", lambda t: "ok", retry_policy=NO_RETRY))
+        assert router.dispatch(Task(type="x")).status == TaskStatus.SUCCEEDED
+
+
+# ---------------------------------------------------------------------------
+# Rate limiter
+# ---------------------------------------------------------------------------
+
+class TestRateLimiter:
+    def test_within_rate_allows_burst(self, router):
+        rl = RateLimiter(max_rate=20.0, max_wait=0.0)
+        router.add(Route.exact("svc", lambda t: "ok", retry_policy=NO_RETRY, rate_limiter=rl))
+        results = [router.dispatch(Task(type="svc")) for _ in range(20)]
+        assert all(r.status == TaskStatus.SUCCEEDED for r in results)
+
+    def test_beyond_burst_rejected_immediately(self, router):
+        rl = RateLimiter(max_rate=5.0, burst=5.0, max_wait=0.0)
+        router.add(Route.exact("svc", lambda t: "ok", retry_policy=NO_RETRY, rate_limiter=rl))
+        results = [router.dispatch(Task(type="svc")) for _ in range(7)]
+        rejected = [r for r in results if r.status == TaskStatus.REJECTED]
+        assert len(rejected) == 2
+
+    def test_max_concurrent_limits_inflight(self):
+        barrier  = threading.Barrier(2)
+        released = threading.Event()
+
+        def handler(t):
+            barrier.wait(timeout=3)
+            released.wait(timeout=3)
+            return "ok"
+
+        rl = RateLimiter(max_concurrent=2, max_wait=0.0)
+        r  = TaskRouter(workers=4, middleware=[])
+        r.add(Route.exact("svc", handler, retry_policy=NO_RETRY, rate_limiter=rl))
+
+        f1 = r.submit(Task(type="svc"))
+        f2 = r.submit(Task(type="svc"))
+        time.sleep(0.1)
+        result3 = r.dispatch(Task(type="svc"))   # 3rd: all slots taken
+        assert result3.status == TaskStatus.REJECTED
+        assert isinstance(result3.error, RateLimitError)
+        released.set()
+        f1.result(timeout=5)
+        f2.result(timeout=5)
+        r.shutdown()
+
+    def test_max_wait_allows_blocking(self, router):
+        rl = RateLimiter(max_rate=10.0, burst=1.0, max_wait=1.0)
+        router.add(Route.exact("svc", lambda t: "ok", retry_policy=NO_RETRY, rate_limiter=rl))
+        router.dispatch(Task(type="svc"))   # drain the single token
+        t0     = time.perf_counter()
+        result = router.dispatch(Task(type="svc"))   # blocks ~0.1s for refill
+        assert result.status == TaskStatus.SUCCEEDED
+        assert time.perf_counter() - t0 >= 0.08
+
+    def test_rate_limiter_none_is_disabled(self, router):
+        router.add(Route.exact("x", lambda t: "ok", retry_policy=NO_RETRY))
+        assert router.dispatch(Task(type="x")).status == TaskStatus.SUCCEEDED
+
+    def test_rejected_result_contains_error(self, router):
+        rl = RateLimiter(max_rate=1.0, burst=1.0, max_wait=0.0)
+        router.add(Route.exact(
+            "r", lambda t: "ok", retry_policy=NO_RETRY, rate_limiter=rl, name="r",
+        ))
+        router.dispatch(Task(type="r"))
+        result = router.dispatch(Task(type="r"))
+        assert result.status == TaskStatus.REJECTED
+        assert isinstance(result.error, RateLimitError)
+
+    def test_rate_limiter_thread_safety(self):
+        # Verifies no corruption under concurrent load: all 200 tasks must
+        # complete with a valid status (none dropped, no exceptions escaped).
+        rl = RateLimiter(max_rate=100.0, burst=100.0, max_wait=0.0)
+        r  = TaskRouter(workers=8, middleware=[])
+        r.add(Route.exact("svc", lambda t: "ok", retry_policy=NO_RETRY, rate_limiter=rl))
+        futures = [r.submit(Task(type="svc")) for _ in range(200)]
+        results = [f.result(timeout=10) for f in futures]
+        valid_statuses = {TaskStatus.SUCCEEDED, TaskStatus.REJECTED}
+        assert all(res.status in valid_statuses for res in results)
+        assert len(results) == 200
+        # Burst is 100, so at least 100 must succeed (some extra may due to refill)
+        succeeded = sum(1 for res in results if res.status == TaskStatus.SUCCEEDED)
+        assert succeeded >= 100
+        r.shutdown()
 
 
 class TestPayload:

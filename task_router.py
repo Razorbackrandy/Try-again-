@@ -7,6 +7,9 @@ Features:
   • Priority queues            – higher-priority tasks run first
   • Scheduled execution        – run tasks at a future time or after a delay
   • Retry with backoff/jitter  – configurable per route
+  • Execution timeout          – per-attempt time budget per route
+  • Circuit breaker            – auto open/close on failure threshold
+  • Rate limiter               – token bucket + concurrency cap per route
   • Middleware chain           – logging, metrics, auth, etc.
   • Thread-pool workers        – concurrent, bounded execution
   • Dead-letter queue          – permanently failed tasks land here
@@ -126,6 +129,216 @@ SLOW_RETRY = RetryPolicy(max_attempts=5,  base_delay=2.0, max_delay=60.0)
 
 
 # ---------------------------------------------------------------------------
+# Resilience exceptions
+# ---------------------------------------------------------------------------
+
+class HandlerTimeoutError(Exception):
+    """Raised when a handler exceeds its per-attempt ``Route.timeout`` budget.
+
+    Counts as a failure and will trigger retries unless excluded via
+    ``RetryPolicy(retryable_on=...)``."""
+    def __init__(self, timeout: float) -> None:
+        super().__init__(f"Handler did not complete within {timeout:.3f}s")
+        self.timeout = timeout
+
+
+class CircuitOpenError(Exception):
+    """Raised (as ``TaskResult.error``) when a circuit breaker fast-fails a request."""
+    def __init__(self, route_name: str) -> None:
+        super().__init__(f"Circuit open for route {route_name!r}")
+        self.route_name = route_name
+
+
+class RateLimitError(Exception):
+    """Raised (as ``TaskResult.error``) when a rate limiter rejects a request."""
+    def __init__(self, route_name: str) -> None:
+        super().__init__(f"Rate limit exceeded for route {route_name!r}")
+        self.route_name = route_name
+
+
+# ---------------------------------------------------------------------------
+# Circuit breaker
+# ---------------------------------------------------------------------------
+
+class CircuitBreakerState(Enum):
+    CLOSED    = "closed"     # normal — requests pass through
+    OPEN      = "open"       # tripped — requests fast-fail
+    HALF_OPEN = "half_open"  # recovery — one probe allowed through
+
+
+@dataclass
+class CircuitBreaker:
+    """
+    Per-route circuit breaker (thread-safe).
+
+    States
+    ------
+    CLOSED    requests pass through; consecutive failures are counted.
+    OPEN      fast-fail all requests; after *recovery_timeout* s → HALF_OPEN.
+    HALF_OPEN one probe request allowed; success → CLOSED, failure → OPEN.
+
+    Parameters
+    ----------
+    failure_threshold:
+        Consecutive failures in CLOSED state that open the circuit.
+    recovery_timeout:
+        Seconds in OPEN state before allowing one probe (transition to HALF_OPEN).
+    success_threshold:
+        Consecutive probe successes in HALF_OPEN required to re-close.
+    """
+    failure_threshold: int   = 5
+    recovery_timeout:  float = 30.0
+    success_threshold: int   = 1
+
+    _state:               CircuitBreakerState = field(
+        default=CircuitBreakerState.CLOSED, init=False, repr=False
+    )
+    _consecutive_failures:  int   = field(default=0,    init=False, repr=False)
+    _consecutive_successes: int   = field(default=0,    init=False, repr=False)
+    _opened_at: Optional[float]   = field(default=None, init=False, repr=False)
+    _probe_in_flight: bool        = field(default=False, init=False, repr=False)
+    _lock: threading.Lock         = field(
+        default_factory=threading.Lock, init=False, repr=False
+    )
+
+    @property
+    def state(self) -> CircuitBreakerState:
+        """Current state snapshot (may change concurrently)."""
+        return self._state
+
+    def allow_request(self) -> bool:
+        """Return True if this request may proceed; False = fast-fail."""
+        with self._lock:
+            if self._state is CircuitBreakerState.CLOSED:
+                return True
+            if self._state is CircuitBreakerState.OPEN:
+                if (self._opened_at is not None
+                        and time.monotonic() - self._opened_at >= self.recovery_timeout):
+                    self._state = CircuitBreakerState.HALF_OPEN
+                    self._consecutive_successes = 0
+                    self._probe_in_flight = True
+                    return True   # this caller is the probe
+                return False
+            # HALF_OPEN: allow only one probe at a time
+            if self._probe_in_flight:
+                return False
+            self._probe_in_flight = True
+            return True
+
+    def record_success(self) -> None:
+        with self._lock:
+            if self._state is CircuitBreakerState.HALF_OPEN:
+                self._consecutive_successes += 1
+                self._probe_in_flight = False
+                if self._consecutive_successes >= self.success_threshold:
+                    self._state = CircuitBreakerState.CLOSED
+                    self._consecutive_failures = 0
+                    self._opened_at = None
+            elif self._state is CircuitBreakerState.CLOSED:
+                self._consecutive_failures = 0
+
+    def record_failure(self) -> None:
+        with self._lock:
+            if self._state is CircuitBreakerState.HALF_OPEN:
+                self._state = CircuitBreakerState.OPEN
+                self._opened_at = time.monotonic()
+                self._probe_in_flight = False
+                self._consecutive_successes = 0
+            elif self._state is CircuitBreakerState.CLOSED:
+                self._consecutive_failures += 1
+                if self._consecutive_failures >= self.failure_threshold:
+                    self._state = CircuitBreakerState.OPEN
+                    self._opened_at = time.monotonic()
+
+
+# ---------------------------------------------------------------------------
+# Rate limiter
+# ---------------------------------------------------------------------------
+
+@dataclass
+class RateLimiter:
+    """
+    Per-route token-bucket rate limiter with optional concurrency cap (thread-safe).
+
+    Parameters
+    ----------
+    max_rate:
+        Maximum sustained throughput in tasks/second (token bucket). 0 = disabled.
+    max_concurrent:
+        Maximum tasks executing concurrently on this route. 0 = disabled.
+    max_wait:
+        Seconds :meth:`acquire` will block before giving up. 0 = fail immediately.
+    burst:
+        Token bucket capacity. Defaults to ``max_rate`` (one second's worth).
+    """
+    max_rate:       float = 0.0
+    max_concurrent: int   = 0
+    max_wait:       float = 0.0
+    burst:          float = 0.0
+
+    def __post_init__(self) -> None:
+        cap = self.burst if self.burst > 0 else max(self.max_rate, 1.0)
+        self._tokens:      float = cap
+        self._capacity:    float = cap
+        self._last_refill: float = time.monotonic()
+        self._lock                        = threading.Lock()
+        self._semaphore: Optional[threading.Semaphore] = (
+            threading.Semaphore(self.max_concurrent) if self.max_concurrent > 0 else None
+        )
+
+    def _refill(self) -> None:
+        """Refill token bucket based on elapsed time (call inside self._lock)."""
+        if self.max_rate <= 0:
+            return
+        now = time.monotonic()
+        self._tokens = min(
+            self._capacity,
+            self._tokens + (now - self._last_refill) * self.max_rate,
+        )
+        self._last_refill = now
+
+    def acquire(self) -> bool:
+        """
+        Acquire a rate-limit token and a concurrency slot.
+
+        Blocks up to ``max_wait`` seconds. Returns ``True`` on success,
+        ``False`` if either limit is exceeded within the wait window.
+
+        **Must** call :meth:`release` in a ``finally`` block on ``True``.
+        """
+        # 1. Token bucket
+        acquired_token = False
+        if self.max_rate > 0:
+            deadline = time.monotonic() + self.max_wait
+            while True:
+                with self._lock:
+                    self._refill()
+                    if self._tokens >= 1.0:
+                        self._tokens -= 1.0
+                        acquired_token = True
+                        break
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                time.sleep(min(0.005, remaining))
+
+        # 2. Concurrency semaphore (acquired after token to avoid wasting tokens)
+        if self._semaphore is not None:
+            if not self._semaphore.acquire(blocking=True, timeout=self.max_wait):
+                if acquired_token:
+                    with self._lock:
+                        self._tokens = min(self._capacity, self._tokens + 1.0)
+                return False
+
+        return True
+
+    def release(self) -> None:
+        """Release the concurrency slot. Safe to call with no semaphore configured."""
+        if self._semaphore is not None:
+            self._semaphore.release()
+
+
+# ---------------------------------------------------------------------------
 # Middleware
 # ---------------------------------------------------------------------------
 
@@ -180,8 +393,11 @@ class Route:
 
     predicate: Callable[[Task], bool]
     handler: Handler
-    retry_policy: RetryPolicy = field(default_factory=RetryPolicy)
-    name: str = ""
+    retry_policy:    RetryPolicy              = field(default_factory=RetryPolicy)
+    name:            str                      = ""
+    timeout:         Optional[float]          = None  # per-attempt seconds; None = disabled
+    circuit_breaker: Optional[CircuitBreaker] = None  # None = disabled
+    rate_limiter:    Optional[RateLimiter]    = None  # None = disabled
 
     # ---- Convenience factories -------------------------------------------
 
@@ -191,7 +407,7 @@ class Route:
         return cls(
             predicate=lambda t, _tt=task_type: t.type == _tt,
             handler=handler,
-            name=f"exact:{task_type}",
+            name=kw.pop("name", f"exact:{task_type}"),
             **kw,
         )
 
@@ -201,7 +417,7 @@ class Route:
         return cls(
             predicate=lambda t, _p=prefix: t.type.startswith(_p),
             handler=handler,
-            name=f"prefix:{prefix}",
+            name=kw.pop("name", f"prefix:{prefix}"),
             **kw,
         )
 
@@ -212,7 +428,7 @@ class Route:
         return cls(
             predicate=lambda t, _c=compiled: bool(_c.match(t.type)),
             handler=handler,
-            name=f"regex:{pattern}",
+            name=kw.pop("name", f"regex:{pattern}"),
             **kw,
         )
 
@@ -224,12 +440,14 @@ class Route:
         **kw,
     ) -> "Route":
         """Match tasks that satisfy an arbitrary *predicate* function."""
-        return cls(predicate=predicate, handler=handler, name="predicate", **kw)
+        return cls(predicate=predicate, handler=handler,
+                   name=kw.pop("name", "predicate"), **kw)
 
     @classmethod
     def wildcard(cls, handler: Handler, **kw) -> "Route":
         """Match every task — typically used as a catch-all fallback."""
-        return cls(predicate=lambda _: True, handler=handler, name="wildcard", **kw)
+        return cls(predicate=lambda _: True, handler=handler,
+                   name=kw.pop("name", "wildcard"), **kw)
 
 
 # ---------------------------------------------------------------------------
@@ -269,6 +487,11 @@ class TaskRouter:
         self._dlq_lock = threading.Lock()
         self._executor = ThreadPoolExecutor(
             max_workers=workers, thread_name_prefix="task-router"
+        )
+        # Dedicated pool for per-attempt timeout enforcement.
+        # max_workers=None → auto-sized (always > outer pool) to prevent deadlock.
+        self._timeout_executor = ThreadPoolExecutor(
+            max_workers=None, thread_name_prefix="task-router-timeout"
         )
         self._heap: List[Task] = []
         self._heap_lock = threading.Lock()
@@ -322,46 +545,83 @@ class TaskRouter:
         return chain
 
     def _execute(self, task: Task, route: Route) -> TaskResult:
-        """Execute a task through middleware + retry loop."""
+        """Execute a task through middleware + resilience layers + retry loop."""
         policy = route.retry_policy
         chain  = self._build_chain(route.handler)
+        rl     = route.rate_limiter
+        cb     = route.circuit_breaker
         t0     = time.perf_counter()
 
-        while True:
-            attempt_start = time.perf_counter()
-            try:
-                value = chain(task)
-                return TaskResult(
-                    task=task,
-                    status=TaskStatus.SUCCEEDED,
-                    value=value,
-                    duration_ms=(time.perf_counter() - t0) * 1000,
-                )
-            except Exception as exc:
-                task.attempt += 1
-                if policy.should_retry(task.attempt, exc):
-                    delay = policy.delay_for(task.attempt)
-                    log.info(
-                        "[%s] retry %d/%d in %.2fs — %s",
-                        task.id[:8], task.attempt, policy.max_attempts, delay, exc,
-                    )
-                    time.sleep(delay)
-                else:
-                    # DEAD = exhausted retries; FAILED = non-retryable exception
-                    status = (
-                        TaskStatus.DEAD
-                        if task.attempt >= policy.max_attempts
-                        else TaskStatus.FAILED
-                    )
-                    result = TaskResult(
+        # Rate limiter: acquired once per dispatch, held across all retry attempts.
+        if rl is not None and not rl.acquire():
+            log.warning("[%s] rate-limited route=%r", task.id[:8], route.name)
+            return TaskResult(
+                task=task,
+                status=TaskStatus.REJECTED,
+                error=RateLimitError(route.name),
+                duration_ms=(time.perf_counter() - t0) * 1000,
+            )
+
+        try:
+            while True:
+                # Circuit breaker: checked before every attempt.
+                if cb is not None and not cb.allow_request():
+                    log.warning("[%s] circuit open route=%r", task.id[:8], route.name)
+                    return TaskResult(
                         task=task,
-                        status=status,
-                        error=exc,
+                        status=TaskStatus.REJECTED,
+                        error=CircuitOpenError(route.name),
                         duration_ms=(time.perf_counter() - t0) * 1000,
                     )
-                    if status == TaskStatus.DEAD:
-                        self._dead_letter_cb(result)
-                    return result
+
+                try:
+                    if route.timeout is not None:
+                        fut = self._timeout_executor.submit(chain, task)
+                        try:
+                            value = fut.result(timeout=route.timeout)
+                        except TimeoutError:
+                            raise HandlerTimeoutError(route.timeout)
+                    else:
+                        value = chain(task)
+
+                    if cb is not None:
+                        cb.record_success()
+                    return TaskResult(
+                        task=task,
+                        status=TaskStatus.SUCCEEDED,
+                        value=value,
+                        duration_ms=(time.perf_counter() - t0) * 1000,
+                    )
+
+                except Exception as exc:
+                    if cb is not None:
+                        cb.record_failure()
+                    task.attempt += 1
+                    if policy.should_retry(task.attempt, exc):
+                        delay = policy.delay_for(task.attempt)
+                        log.info(
+                            "[%s] retry %d/%d in %.2fs — %s",
+                            task.id[:8], task.attempt, policy.max_attempts, delay, exc,
+                        )
+                        time.sleep(delay)
+                    else:
+                        status = (
+                            TaskStatus.DEAD
+                            if task.attempt >= policy.max_attempts
+                            else TaskStatus.FAILED
+                        )
+                        result = TaskResult(
+                            task=task,
+                            status=status,
+                            error=exc,
+                            duration_ms=(time.perf_counter() - t0) * 1000,
+                        )
+                        if status == TaskStatus.DEAD:
+                            self._dead_letter_cb(result)
+                        return result
+        finally:
+            if rl is not None:
+                rl.release()
 
     # ---- Dispatch --------------------------------------------------------
 
@@ -500,9 +760,10 @@ class TaskRouter:
     # ---- Lifecycle -------------------------------------------------------
 
     def shutdown(self, wait: bool = True) -> None:
-        """Shut down the scheduler (if running) and worker pool."""
+        """Shut down the scheduler (if running) and worker pools."""
         self.stop(wait=wait)
         self._executor.shutdown(wait=wait)
+        self._timeout_executor.shutdown(wait=False)  # abandon any leaked timeout threads
 
     def __enter__(self) -> "TaskRouter":
         self.start()
