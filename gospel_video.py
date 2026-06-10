@@ -10,7 +10,16 @@ from moviepy import (
 from moviepy.video.fx import CrossFadeIn, CrossFadeOut
 import numpy as np
 from PIL import Image, ImageDraw, ImageFilter
-import os
+import os, glob
+
+# Resolve font paths from the system TTF directory
+def _find_font(name_fragment):
+    hits = glob.glob(f'/usr/share/fonts/**/*{name_fragment}*', recursive=True)
+    ttf  = [h for h in hits if h.lower().endswith(('.ttf', '.otf'))]
+    return ttf[0] if ttf else None
+
+FONT_BOLD   = _find_font('DejaVuSans-Bold') or _find_font('FreeSansBold') or 'DejaVu-Sans-Bold'
+FONT_NORMAL = _find_font('DejaVuSans.ttf')  or _find_font('FreeSans.ttf') or 'DejaVu-Sans'
 
 # ---------------------------------------------------------------------------
 # Lyrics with timestamps (seconds) — total target: 180 s
@@ -109,18 +118,12 @@ FPS = 24
 # ---------------------------------------------------------------------------
 
 def make_gradient_bg(t, total):
-    """Return an H×W×3 numpy array — slow colour drift over time."""
-    arr = np.zeros((H, W, 3), dtype=np.uint8)
-    phase = t / total   # 0 → 1
-    # Top colour slowly brightens
-    top = np.array(BG_TOP, dtype=float) + phase * np.array([5, 15, 30], dtype=float)
-    bot = np.array(BG_BOTTOM, dtype=float) + phase * np.array([20, 0, 10], dtype=float)
-    top = np.clip(top, 0, 255)
-    bot = np.clip(bot, 0, 255)
-    for row in range(H):
-        ratio = row / H
-        arr[row] = (top * (1 - ratio) + bot * ratio).astype(np.uint8)
-    return arr
+    phase = t / total
+    top   = np.clip(np.array(BG_TOP,    float) + phase * np.array([5, 15, 30]),  0, 255)
+    bot   = np.clip(np.array(BG_BOTTOM, float) + phase * np.array([20, 0, 10]), 0, 255)
+    rows  = np.linspace(0, 1, H)[:, np.newaxis, np.newaxis]
+    arr   = (top * (1 - rows) + bot * rows).astype(np.uint8)  # (H,1,3)
+    return np.broadcast_to(arr, (H, W, 3)).copy()
 
 
 def make_star_overlay():
@@ -217,7 +220,7 @@ def make_lyric_clip(text, start, end, section):
         text=text,
         font_size=fontsize,
         color=hex_col,
-        font="DejaVu-Sans-Bold",
+        font=FONT_BOLD,
         text_align="center",
         method="caption",
         size=(int(W * 0.85), None),
@@ -225,10 +228,10 @@ def make_lyric_clip(text, start, end, section):
         stroke_width=3,
     )
 
-    # Fade in/out
+    # Fade in/out (duration must be set before effects)
     fade = min(0.6, duration * 0.2)
-    txt = txt.with_effects([CrossFadeIn(fade), CrossFadeOut(fade)])
     txt = txt.with_duration(duration)
+    txt = txt.with_effects([CrossFadeIn(fade), CrossFadeOut(fade)])
     txt = txt.with_start(start)
 
     # Position: bottom third for verses, centre for chorus/bridge
@@ -267,12 +270,13 @@ def make_label(label_text, start, end):
         text=label_text,
         font_size=28,
         color="#AAAACC",
-        font="DejaVu-Sans",
+        font=FONT_NORMAL,
         method="label",
     )
-    lbl = lbl.with_duration(dur).with_start(min(start, TARGET))
-    lbl = lbl.with_position((60, 40))
+    lbl = lbl.with_duration(dur)
     lbl = lbl.with_effects([CrossFadeIn(0.4), CrossFadeOut(0.4)])
+    lbl = lbl.with_start(min(start, TARGET))
+    lbl = lbl.with_position((60, 40))
     return lbl
 
 
@@ -301,27 +305,29 @@ title_main = TextClip(
     text="Jesus Comin' By and By",
     font_size=90,
     color="#FFD700",
-    font="DejaVu-Sans-Bold",
+    font=FONT_BOLD,
     method="label",
     stroke_color="#000000",
     stroke_width=4,
 )
-title_main = title_main.with_duration(6).with_start(0)
-title_main = title_main.with_position(("center", int(H * 0.38)))
+title_main = title_main.with_duration(6)
 title_main = title_main.with_effects([CrossFadeIn(1.0), CrossFadeOut(1.0)])
+title_main = title_main.with_start(0)
+title_main = title_main.with_position(("center", int(H * 0.38)))
 
 title_sub = TextClip(
     text="A Gospel Celebration",
     font_size=44,
     color="#FFFFFF",
-    font="DejaVu-Sans",
+    font=FONT_NORMAL,
     method="label",
     stroke_color="#000000",
     stroke_width=2,
 )
-title_sub = title_sub.with_duration(6).with_start(0)
-title_sub = title_sub.with_position(("center", int(H * 0.54)))
+title_sub = title_sub.with_duration(6)
 title_sub = title_sub.with_effects([CrossFadeIn(1.5), CrossFadeOut(1.0)])
+title_sub = title_sub.with_start(0)
+title_sub = title_sub.with_position(("center", int(H * 0.54)))
 
 
 # ---------------------------------------------------------------------------
